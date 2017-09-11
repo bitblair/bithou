@@ -24,6 +24,7 @@ class NodeTraverse(object):
             ignore_categories (list): Ignore categories of nodes.
         """
         self.node = node
+        self.traversed = dict()
         try:
             bypassed = node.isBypassed()
         except AttributeError:
@@ -36,60 +37,82 @@ class NodeTraverse(object):
                 pass
         self.outputs = [x for x in node.outputs() if x]
         self.connected = self.inputs + self.outputs
+        self.ignore_hda_locked = ignore_hda_locked
+
+        ignore_categories = ignore_categories or []
+        if hou.vopNodeTypeCategory() not in ignore_categories:
+            ignore_categories.append(hou.vopNodeTypeCategory())
+        self.ignore_categories = ignore_categories
 
         if bypassed and respect_bypass:
             self.references = []
         else:
-            ignore_categories = ignore_categories or []
-            if hou.vopNodeTypeCategory() not in ignore_categories:
-                ignore_categories.append(hou.vopNodeTypeCategory())
-            self.references = self._get_all_references(ignore_hda_locked,
-                                                       ignore_categories)
+            self.references = self._get_references()
 
-    def _get_all_references(self, ignore_hda_locked, ignore_categories):
-        """ Get all references for this node and its children.
-        Args:
-            ignore_hda_locked (bool): Ignore nodes locked in hdas.
-            ignore_categories (list): Ignore categories of nodes.
+        self.child_output = []
+        if not self.node.isLockedHDA():
+            self.child_output = list(get_child_output(node))
 
-        Returns:
-            list: hou.Node(s) listed as refs.
-        """
-        refs = set()
-        all_children = list(self.node.allSubChildren())
-        all_children.append(self.node)
-        ignore = set()
-        ignore.update(all_children)
-        for n in all_children:
-            if not is_editable(n) and ignore_hda_locked:
-                continue
-            elif n.type().category() in ignore_categories:
-                continue
-            refs.update(self._get_references(n, ignore))
-            ignore.update(refs)
+        self.to_traverse = self.references + self.inputs + self.child_output
 
-        refs = [x for x in refs if x not in self.inputs not in self.outputs]
-        return refs
-
-    @staticmethod
-    def _get_references(node, ignore=None):
+    def _get_references(self):
         """ Get references for specified node, and optionally ignore nodes.
-        Args:
-            node (hou.Node): Node to operate on.
-            ignore (list): Nodes to ignore.
-
         Returns:
             list: hou.Node(s) found as references.
         """
-        ignore = ignore or []
-        path = node.path()
+        path = self.node.path()
         global _traversed
         refs = _traversed.get(path, list())
         if not refs:
-            refs = find_node_references(node)
-            refs = [x for x in refs if x not in ignore]
-            _traversed[path] = tuple(refs)
-        return refs
+            refs = [n for n in find_node_references(self.node)
+                    if not n == self.node]
+            self.traversed[path] = tuple(refs)
+        return list(refs)
+
+
+def get_output_nodes(node, only_connected=True):
+    """ Find any output nodes inside this node. This only works on SOPs.
+    Args:
+        node (hou.Node): Node to operate on.
+        only_connected (bool): Only return outputs that have active connections.
+
+    Returns:
+        tuple: Output nodes inside this node.
+    """
+    if not node.childTypeCategory() == hou.sopNodeTypeCategory():
+        return ()
+    outputs = list()
+    connections = node.outputConnections()
+    indices = [c.inputItemOutputIndex() for c in connections]
+    for n in node.children():
+        if n.type().name() == 'output':
+            output_index = n.evalParm('outputidx')
+            if only_connected and not output_index in indices:
+                continue
+            outputs.append(n)
+    return tuple(outputs)
+
+
+def get_child_output(node, only_connected=True):
+    """ Find the output/display/render node for this node.
+    Args:
+        node (hou.Node): Node to operate on.
+        only_connected (bool): If outputs are found, only return connected nodes.
+
+    Returns:
+        tuple: Output node(s), this can be multiple if multiple output nodes
+        exist.
+    """
+    outputs = get_output_nodes(node, only_connected=only_connected)
+    if outputs:
+        return outputs
+    category = node.childTypeCategory()
+    if category == hou.sopNodeTypeCategory():
+        return node.renderNode(),
+    elif category == hou.dopNodeTypeCategory():
+        return node.displayNode(),
+    else:
+        return ()
 
 
 def has_expression(parm):
@@ -103,7 +126,7 @@ def has_expression(parm):
         bool: True if parm contains expression, False otherwise.
     """
     keyframes = parm.keyframes()
-    if not keyframes:
+    if len(keyframes) != 1:
         return False
     else:
         for keyframe in keyframes:
@@ -224,12 +247,14 @@ def traverse(root,
                                       respect_lock=respect_lock,
                                       ignore_hda_locked=ignore_hda_locked,
                                       ignore_categories=ignore_categories)
-                         for r in roots]
+                         for r in roots if not r.type().isManager()]
             roots = set()
             for t in traversed:
-                _all = t.inputs + t.references
-                _all = [n for n in _all if n.path() not in _traversed.keys()]
-                roots.update(_all)
+                to_traverse = t.to_traverse
+                to_traverse = [n for n in to_traverse
+                               if n.path() not in _traversed.keys()]
+                _traversed.update(t.traversed)
+                roots.update(to_traverse)
         skip_root = True
         yield tuple(roots)
 
@@ -247,7 +272,7 @@ def is_valid_file(value):
     return bool(file_pattern.match(value))
 
 
-def find_file_references(node, inspect_hda=True, skip_vops=True):
+def find_file_references(node, inspect_hda=False, skip_vops=True):
     """ Find file references for specified node.
     Args:
         node (hou.Node): Node to operate on.
@@ -267,8 +292,11 @@ def find_file_references(node, inspect_hda=True, skip_vops=True):
         nodes = [n for n in nodes if
                  n.type().category() != hou.vopNodeTypeCategory()]
     for inode in nodes:
+        inode.updateParmStates()
         for parm in inode.parms():
             if not parm.parmTemplate().dataType() == hou.parmData.String:
+                continue
+            elif not parm.eval():
                 continue
             elif parm.isDisabled():
                 continue
