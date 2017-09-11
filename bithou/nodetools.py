@@ -296,8 +296,6 @@ def find_file_references(node, inspect_hda=False, skip_vops=True):
         for parm in inode.parms():
             if not parm.parmTemplate().dataType() == hou.parmData.String:
                 continue
-            elif not parm.eval():
-                continue
             elif parm.isDisabled():
                 continue
             elif parm.getReferencedParm().node in nodes:
